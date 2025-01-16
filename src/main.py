@@ -2,10 +2,8 @@ from datetime import datetime
 
 import click
 import zarr
-from coiled_app import spawn_coiled_jobs
+from dask_app import spawn_dask_jobs
 from lib import JobConfig, save_output_log
-from lithops_app import spawn_lithops_jobs
-from modal_app import spawn_modal_jobs
 from storage import ArraylakeStorage, ZarrFSSpecStorage
 
 
@@ -14,13 +12,13 @@ from storage import ArraylakeStorage, ZarrFSSpecStorage
     "--start-date",
     type=click.DateTime(),
     required=True,
-    help="Start date for the data cube. Everything but year and month will be ignored.",
+    help="Start date for the data cube. Everything but year will be ignored.",
 )
 @click.option(
     "--end-date",
     type=click.DateTime(),
     required=True,
-    help="Start date for the data cube. Everything but year and month will be ignored.",
+    help="End date for the data cube. Everything but year will be ignored .",
 )
 @click.option(
     "--bbox",
@@ -30,37 +28,49 @@ from storage import ArraylakeStorage, ZarrFSSpecStorage
     "(min_lon, min_lat, max_lon, max_lat)",
 )
 @click.option(
-    "--time-frequency-months",
-    default=1,
-    type=click.IntRange(1, 24),
-    help="Temporal sampling frequency in months.",
+    "--time-frequency-years",
+    default=5,
+    type=click.IntRange(1, 10),
+    help="Temporal sampling frequency in years.",
 )
 @click.option(
     "--resolution",
     type=float,
-    default=1 / 3600,
+    default=0.009,
     show_default=True,
     help="Spatial resolution in degrees.",
 )
 @click.option(
     "--chunk-size",
     type=int,
-    default=1200,
+    default=100,
     show_default=True,
     help="Zarr chunk size for the data cube.",
 )
 @click.option(
     "--bands",
     multiple=True,
-    default=["red", "green", "blue"],
+    default=["AA", "AG", "BU", "HI", "PO", "EX", "FR", "TI", "NS"],
     show_default=True,
     help="Bands to include in the data cube. Must match band names from odc.stac.load",
 )
 @click.option(
+    "--ee-path",
+    default="projects/hm-30x30/assets/output/v20240801/HM_change_300",
+    show_default=True,
+    help="The path to the Earth Engine data.",
+)
+@click.option(
     "--varname",
-    default="rgb_median",
+    default="hm",
     show_default=True,
     help="The name of the variable to use in the Zarr data cube.",
+)
+@click.option(
+    "--ee-threads",
+    default=1,
+    show_default=True,
+    help="The name of threads per worker for ee requests.",
 )
 @click.option(
     "--epsg",
@@ -72,7 +82,7 @@ from storage import ArraylakeStorage, ZarrFSSpecStorage
 @click.option(
     "--serverless-backend",
     required=True,
-    type=click.Choice(["coiled", "modal", "lithops"]),
+    type=click.Choice(["dask"]),
 )
 @click.option(
     "--storage-backend",
@@ -107,9 +117,11 @@ def main(
     start_date: datetime,
     end_date: datetime,
     bbox: tuple[float, float, float, float],
-    time_frequency_months: int,
+    time_frequency_years: int,
     resolution: float,
     chunk_size: int,
+    ee_threads: int,
+    ee_path: str,
     bands: list[str],
     varname: str,
     epsg: str,
@@ -125,12 +137,14 @@ def main(
         dx=resolution,
         epsg=int(epsg),
         bounds=bbox,
+        ee_path=ee_path,
         start_date=start_date,
         end_date=end_date,
-        time_frequency_months=time_frequency_months,
+        time_frequency_years=time_frequency_years,
         bands=bands,
         varname=varname,
         chunk_size=chunk_size,
+        ee_threads=ee_threads,
     )
 
     if storage_backend == "arraylake":
@@ -148,18 +162,14 @@ def main(
     ) as job_gen:
         jobs = list(job_gen)
 
-    if serverless_backend == "lithops":
-        spawn = spawn_lithops_jobs
-    elif serverless_backend == "coiled":
-        spawn = spawn_coiled_jobs
-    elif serverless_backend == "modal":
-        spawn = spawn_modal_jobs
+    if serverless_backend == "dask":
+        spawn = spawn_dask_jobs
     else:
         raise NotImplementedError
 
     target_array = zarr.open(storage.get_zarr_store(), path=job_config.varname)
 
-    # click.echo(f"Spawning {len(jobs)} jobs")
+    click.echo(f"Spawning {len(jobs)} jobs")
 
     with click.progressbar(
         jobs,

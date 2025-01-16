@@ -6,20 +6,17 @@ import logging
 import os
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from time import perf_counter, time
 from typing import Generator
 
-import dask
+import ee
 import numpy as np
-import odc.stac
 import pandas as pd
-import pystac_client
+import xarray as xr
 import zarr
 from cartopy.feature import LAND
-from odc.algo import erase_bad, mask_cleanup
 from odc.geo.geobox import GeoBox, GeoboxTiles
 from odc.geo.xr import xr_zeros
 
@@ -31,10 +28,12 @@ class JobConfig:
     bounds: tuple[float, float, float, float]
     start_date: datetime
     end_date: datetime
-    time_frequency_months: int
+    time_frequency_years: int
     bands: list[str]
+    ee_path: str
     varname: str
     chunk_size: int
+    ee_threads: int
 
     @property
     def crs(self) -> str:
@@ -62,7 +61,7 @@ class JobConfig:
         return pd.date_range(
             start=self.start_date,
             end=self.end_date,
-            freq=f"{self.time_frequency_months}MS",
+            freq=f"{self.time_frequency_years}Y",
         )
 
     @property
@@ -74,7 +73,7 @@ class JobConfig:
         storage.initialize()
 
         big_ds = (
-            xr_zeros(self.geobox, chunks=-1, dtype="uint16")
+            xr_zeros(self.geobox, chunks=-1, dtype="int16")
             .expand_dims(
                 {
                     "band": self.bands,
@@ -83,7 +82,10 @@ class JobConfig:
             )
             .transpose(..., "band")
         ).to_dataset(name=self.varname)
-        big_ds.attrs["title"] = "Sentinel 2 Data Cube"
+        # fill with na value
+        # big_ds = big_ds - 32768
+
+        big_ds.attrs["title"] = "HM data cube"
 
         lon_encoding = optimize_coord_encoding(big_ds.longitude.values, self.dx)
         lat_encoding = optimize_coord_encoding(big_ds.latitude.values, -self.dx)
@@ -94,13 +96,13 @@ class JobConfig:
                 "chunks": big_ds.time.shape,
                 "compressor": zarr.Blosc(cname="zstd"),
             },
-            "rgb_median": {
+            "hm": {
                 "chunks": (1,) + self.chunk_shape + (len(self.bands),),
                 "compressor": zarr.Blosc(cname="zstd"),
                 # workaround to create a fill value for the underlying zarr array
                 # since Xarray doesn't let us specify one explicitly
-                "_FillValue": 0,
-                "dtype": "uint16",
+                "_FillValue": -32768,
+                "dtype": "int16",
             },
         }
 
@@ -122,12 +124,12 @@ class JobConfig:
             bbox = tile.boundingbox
             extent = bbox.left, bbox.right, bbox.bottom, bbox.top
             igeoms = list(LAND.intersecting_geometries(extent))
+
             is_land = len(igeoms) > 0
+
             if is_land:
                 for date in self.time_data:
-                    yield ChunkProcessingJob(
-                        self, tile_index=idx, year=date.year, month=date.month
-                    )
+                    yield ChunkProcessingJob(self, tile_index=idx, year=date.year)
                     count += 1
                     if limit and count >= limit:
                         return
@@ -150,7 +152,6 @@ class ChunkProcessingJob:
     config: JobConfig
     tile_index: tuple[int, int]
     year: int
-    month: int
 
     def process(
         self,
@@ -171,36 +172,33 @@ class ChunkProcessingJob:
             stderr_handler.setFormatter(formatter)
             logger.addHandler(stderr_handler)
 
-        odc.stac.configure_rio(cloud_defaults=True, aws={"aws_unsigned": True})
-
         geobox = self.config.tiles[self.tile_index]
-        geom = geobox.geographic_extent
 
-        start_date = datetime(self.year, self.month, 1)
-        next_month = ((self.month + self.config.time_frequency_months - 1) % 12) + 1
-        next_year = (
-            self.year + (self.month + self.config.time_frequency_months - 1) // 12
-        )
-        end_date = datetime(next_year, next_month, 1) - timedelta(days=1)
-        date_query = (
-            start_date.strftime("%Y-%m-%d") + "/" + end_date.strftime("%Y-%m-%d")
-        )
+        start_date = datetime(self.year, 1, 1)
+        next_year = self.year + self.config.time_frequency_years
+        end_date = datetime(next_year, 1, 1) - timedelta(days=1)
 
         tic1 = perf_counter()
-        items = (
-            pystac_client.Client.open("https://earth-search.aws.element84.com/v1")
-            .search(
-                intersects=geom,
-                collections=["sentinel-2-c1-l2a"],
-                datetime=date_query,
-                limit=400,
-            )
-            .item_collection()
-        )
 
+        ic = ee.ImageCollection(self.config.ee_path).filterDate(
+            start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d")
+        )
+        # pad with 1 pixel to avoid edge effects
+        bbox = ee.Geometry.Rectangle(
+            geobox.boundingbox[0] + self.config.dx,
+            geobox.boundingbox[1] + self.config.dx,
+            geobox.boundingbox[2] + self.config.dx,
+            geobox.boundingbox[3] + self.config.dx,
+        )
+        # create a template xarray as we are not guaranteed
+        # that the result from gee will be exactly the same coords
+        # as the geobox
+        template = xr_zeros(geobox, chunks=-1, dtype="int16")
+
+        ic_len = ic.size().getInfo()
         tic2 = perf_counter()
 
-        if len(items) == 0:
+        if ic_len == 0:
             return ChunkProcessingResult(
                 success=False,
                 num_scenes=0,
@@ -211,63 +209,76 @@ class ChunkProcessingJob:
                 region=os.environ.get("MODAL_REGION", None),
                 cloud_provider=os.environ.get("MODAL_CLOUD_PROVIDER", None),
             )
-
-        ds = odc.stac.load(
-            items,
-            bands=["scl"] + list(self.config.bands),
-            chunks={"time": 1, "x": 600, "y": 600},
-            geobox=geobox,
-            resampling="bilinear",
-            groupby="solar_day",
+        # TODO: optimize the request size
+        # Requests are limited to 48MB in uncompressed data per request
+        # computed as the product of the request dimensions in pixels
+        # the number of image bands requested,
+        # and the number of bytes per pixel for each band.
+        # Requests are also limited to at most 32K pixels
+        # in either dimension and at most 1024 bands.
+        # Requests exceeding these limits will result
+        # in an error code of 400 (BAD_REQUEST).
+        ds = xr.open_dataset(
+            ic,
+            engine="ee",
+            crs="EPSG:4326",
+            scale=self.config.dx,
+            geometry=bbox,
+            executor_kwargs={"max_workers": self.config.ee_threads},
         )
+        ds = ds.median(dim="time")
 
-        VEGETATION = 4
-        NOT_VEGETATED = 5
-        allowed_values = [VEGETATION, NOT_VEGETATED]
+        # interpolate to the template
+        ds = ds.interp_like(template, method="nearest", assume_sorted=True)
 
-        cloud_mask = ~ds.scl.isin(allowed_values)
-        cloud_mask = mask_cleanup(cloud_mask, [("closing", 5), ("opening", 5)])
-        ds_masked = erase_bad(ds[["red", "green", "blue"]], cloud_mask)
-
-        rgb_median = (
-            ds_masked.where(ds_masked > 0)
-            .to_dataarray(dim="band")
-            .median(dim="time")
-            .astype("uint16")
-            .transpose(..., "band")
-        )
+        # todo: filter bands
+        ds = ds.to_dataarray(dim="band")
+        ds = ds * 10000
+        ds = ds.fillna(-32768).astype("int16").transpose(..., "band")
 
         # oversubscribe the thread pool to saturate IO
         # make sure we are using the threaded scheduler and not a cluster (in Coiled)
-        with dask.config.set(pool=ThreadPoolExecutor(16), scheduler="threads"):
-            raw_data = rgb_median.values
+        #      with dask.config.set(pool=ThreadPoolExecutor(16), scheduler="threads"):
+        raw_data = ds.values
+
         tic3 = perf_counter()
 
         # target_array = zarr.open(repo.store, path=varname)
 
         xy_slice = tuple(
-            slice(cs * ci, cs * (ci + 1))
-            for cs, ci in zip(geobox.shape, self.tile_index)
+            slice(
+                cs * ci
+                if cs == self.config.chunk_shape[axis]
+                else (self.config.chunk_shape[axis] * ci),
+                cs * (ci + 1)
+                if cs == self.config.chunk_shape[axis]
+                else (self.config.chunk_shape[axis] * ci) + cs,
+            )
+            for cs, ci, axis in zip(geobox.shape, self.tile_index, range(2))
         )
 
         # not writing with xarray, so have to reverse engineer the time index
         time_index = (
-            12 * (self.year - self.config.start_date.year)
-            + (self.month - self.config.start_date.month)
-        ) // self.config.time_frequency_months
+            self.year - self.config.start_date.year
+        ) // self.config.time_frequency_years
 
         # all elements of the selector need to be slices
         # https://github.com/zarr-developers/zarr-python/issues/1730
         target_slice = (slice(time_index, time_index + 1),) + xy_slice
 
+        # todo figure out why the array needs to be rotated
+        raw_data = np.rot90(raw_data, k=1, axes=(0, 1))
+
         # need to expand out the time dimension
-        target_array[target_slice] = raw_data[None, ...]
+        raw_data = raw_data[None, ...]
+        # raw_data = einops.rearrange(raw_data, 'a b c d -> a c b d')
+        target_array[target_slice] = raw_data
 
         tic4 = perf_counter()
 
         return ChunkProcessingResult(
             success=True,
-            num_scenes=len(items),
+            num_scenes=ic_len,
             start_time=start_time,
             search_duration=tic2 - tic1,
             load_duration=tic3 - tic2,
