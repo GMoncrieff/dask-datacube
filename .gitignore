@@ -95,6 +95,7 @@ target/
 # Jupyter Notebook
 *.ipynb
 .ipynb_checkpoints
+!s3_cube.ipynb
 
 # pyenv
 .python-version
