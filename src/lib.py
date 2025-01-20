@@ -61,7 +61,8 @@ class JobConfig:
         return pd.date_range(
             start=self.start_date,
             end=self.end_date,
-            freq=f"{self.time_frequency_years}Y",
+            freq=pd.DateOffset(years=self.time_frequency_years),
+            inclusive="left",
         )
 
     @property
