@@ -93,9 +93,9 @@ docs/_build/
 target/
 
 # Jupyter Notebook
-*.ipynb
+#*.ipynb
 .ipynb_checkpoints
-!s3_cube.ipynb
+build_dc.ipynb
 
 # pyenv
 .python-version
