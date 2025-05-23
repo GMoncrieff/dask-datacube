@@ -67,7 +67,7 @@ Options:
 
 ## Example Usage
 
-Human modification Datacube, store in local zarr
+Human modification datacube, store in local zarr
 
 ```
 python src/main.py --start-date 2000-01-01 --end-date 2010-12-31 --bbox 17.58 -35.00 21.38 -32.23 \
