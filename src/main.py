@@ -43,7 +43,7 @@ from storage import ArraylakeStorage, ZarrFSSpecStorage
 @click.option(
     "--chunk-size",
     type=int,
-    default=100,
+    default=170,
     show_default=True,
     help="Zarr chunk size for the data cube.",
 )

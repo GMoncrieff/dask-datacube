@@ -1,6 +1,6 @@
 import ee
 import zarr
-from dask.distributed import Client, LocalCluster, Worker
+from dask.distributed import Client, LocalCluster, Worker, performance_report
 from distributed.diagnostics.plugin import WorkerPlugin
 from lib import ChunkProcessingJob, ChunkProcessingResult
 from tqdm import tqdm
@@ -43,26 +43,24 @@ def spawn_dask_jobs(
     plugin = Plugin()
     client.register_plugin(plugin)
 
-    # monitor the submission of jobs
-    jobs = list(jobs)
-    futures = [
-        client.submit(process_chunk, job, array, debug=debug, retries=5)
-        for job in tqdm(jobs, desc="Submitting jobs")
-    ]
-
-    # block until completed. we can use dask dashboard to monitor progress
-    results = client.gather(futures)
+    with performance_report(filename="dask_report.html"):
+        # monitor the submission of jobs
+        jobs = list(jobs)
+        results = []
+        batch_size = 100
+    
+        for i in range(0, len(jobs), batch_size):
+            batch = jobs[i:i + batch_size]
+            futures = [
+                client.submit(process_chunk, job, array, debug=debug, retries=5)
+                for job in tqdm(batch, desc=f"Submitting jobs batch {i//batch_size + 1}")
+            ]
+    
+            # block until batch completed
+            batch_results = client.gather(futures)
+            results.extend(batch_results)
 
     # Shut down the client
     client.close()
-
-    # monitor the submission of jobs
-    # jobs = list(jobs)
-    # ee.Initialize(
-    # project='hm-30x30',
-    # opt_url='https://earthengine-highvolume.googleapis.com')
-    # futures = []
-    # for job in tqdm(jobs, desc="Submitting jobs"):
-    #    results = process_chunk(job, array, debug=debug)
 
     return results

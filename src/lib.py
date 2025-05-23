@@ -106,7 +106,6 @@ class JobConfig:
                 "dtype": "int16",
             },
         }
-
         print(big_ds)
         big_ds.to_zarr(
             storage.get_zarr_store(),
@@ -236,7 +235,7 @@ class ChunkProcessingJob:
         ds = ds.to_dataarray(dim="band")
         ds = ds * 10000
         ds = ds.fillna(-32768).astype("int16").transpose(..., "band")
-
+ 
         # oversubscribe the thread pool to saturate IO
         # make sure we are using the threaded scheduler and not a cluster (in Coiled)
         #      with dask.config.set(pool=ThreadPoolExecutor(16), scheduler="threads"):
