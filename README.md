@@ -13,7 +13,7 @@ If you want to build on top of it, fork this repo and modify it to your needs.
 
 **Supported Storage Locations**
 
-- [Arraylake](https://docs.earthmover.io/) - Earthmover's data lake platform for Zarr data
+- [Arraylake](https://docs.earthmover.io/) - Earthmover's datalake platform for Zarr data
 - Any [fsspec](https://filesystem-spec.readthedocs.io/en/latest/)-compatible cloud storage location (e.g. S3)
 
 ## Usage
